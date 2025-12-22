@@ -3,9 +3,18 @@ import json
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Tuple, Optional, Union
 import os
+import shutil
 import torch
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import pandas as pd
+import binascii
+import traceback
+import ast
+from tqdm import tqdm
+from collections import defaultdict
+
+# Librerie AI & NLP
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 from chromadb.config import Settings
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
@@ -13,44 +22,43 @@ import nltk
 from nltk.stem import WordNetLemmatizer
 from nltk.corpus import stopwords
 import spacy
-import ast
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import pandas as pd
-import binascii
-import traceback
-from tqdm import tqdm
-from collections import defaultdict
+from rank_bm25 import BM25Okapi
 
 # ==============================================================================
 # 1. CONFIGURAZIONE INIZIALE E COSTANTI
 # ==============================================================================
 
+# --- MODELLI SOTA (STATE OF THE ART) 2025 ---
+EMBEDDING_MODEL = 'BAAI/bge-m3'
+CROSS_ENCODER_MODEL = 'BAAI/bge-reranker-v2-m3'
+LLM_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+# PATHS
+CHROMA_DB_PATH = "./chroma_db_bge_m3_final_v7_complete" 
+CAPEC_XML_FILE = "CAPEC.xml"
+HONEYPOT_CSV_FILE = "tpot_less.csv"
+
+# NLP SETUP
 try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
-    print("\033[1;33m[CONFIGURAZIONE] Download del modello Spacy...\033[0m")
+    print("\033[1;33m[CONFIG] Download modello Spacy...\033[0m")
     spacy.cli.download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
+
 try:
     nltk.data.find('corpora/wordnet')
     nltk.data.find('tokenizers/punkt')
     nltk.data.find('corpora/stopwords')
 except LookupError:
-    print("\033[1;33m[CONFIGURAZIONE] Download dei dati NLTK...\033[0m")
+    print("\033[1;33m[CONFIG] Download dati NLTK...\033[0m")
     nltk.download('wordnet', quiet=True)
     nltk.download('punkt', quiet=True)
     nltk.download('stopwords', quiet=True)
 
 lemmatizer = WordNetLemmatizer()
 stop_words = set(stopwords.words('english'))
-
 NS = {'capec': 'http://capec.mitre.org/capec-3', 'xhtml': 'http://www.w3.org/1999/xhtml'}
-EMBEDDING_MODEL = 'basel/ATTACK-BERT'
-LLM_MODEL = "mistralai/Mistral-7B-Instruct-v0.2"
-CHROMA_DB_PATH = "./chroma_db_all_hps_v3_focused"
-CAPEC_XML_FILE = "CAPEC.xml"
-HONEYPOT_CSV_FILE = "tpot_less.csv"
 
 ACRONYM_MAP = {"XSS": "cross site scripting", "SQLi": "sql injection", "CSRF": "cross site request forgery",
                "RCE": "remote code execution", "LFI": "local file inclusion", "XXE": "xml external entity injection",
@@ -71,36 +79,27 @@ def expand_technical_terms(text: str) -> str:
     return text
 
 def get_enhanced_tokens(text: str) -> List[str]:
+    """Tokenizzazione ottimizzata per BM25: mantiene comandi shell e path."""
     if not isinstance(text, str): return []
     doc = nlp(text)
-    tokens = [token.lemma_.lower() for token in doc if
-              not token.is_stop and not token.is_punct and token.pos_ in ['NOUN', 'VERB', 'ADJ', 'PROPN'] and len(token.lemma_) > 2]
-    bigrams = [' '.join(tokens[i:i + 2]) for i in range(len(tokens) - 1)]
-    trigrams = [' '.join(tokens[i:i + 3]) for i in range(len(tokens) - 2)]
-    return [t for t in tokens + bigrams + trigrams if t and t.strip()]
+    # Manteniamo token anche se corti se sono simboli tecnici (es. ; | / )
+    tokens = [token.text.lower() for token in doc if not token.is_stop] 
+    return tokens
 
 def preprocess_text(text: str) -> str:
     if not isinstance(text, str): return str(text)
     text = text.lower()
-    text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '', text)
-    text = re.sub(r'\bv(?:ersion)?\s*\d+(\.\d+)+(\.\d+)*\b', '', text)
-    text = re.sub(r'\b\d+(\.\d+)+\b', ' number ', text)
-    text = re.sub(r'\b\d+\b', ' number ', text)
-    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', ' ip_addr ', text)
+    # Preservation of shell operators and path separators
+    text = re.sub(r'[^\w\s\-\./\\:;|&=<>]', ' ', text) 
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def remove_unwanted_terms(text: str) -> str:
     if not isinstance(text, str): return str(text)
     text = re.sub(r'\b(capec|cwe)\s*\d*\b', '', text, flags=re.IGNORECASE)
-    generic_terms = ['description', 'mitigations', 'mitigation', 'execution flow', 'prerequisites', 'prerequisite',
-                     'summary', 'details', 'content', 'example', 'reference', 'related', 'attack', 'pattern', 'step',
-                     'phase', 'objective', 'technique', 'procedure', 'tactic', 'common', 'consequence', 'likelihood',
-                     'severity', 'skill', 'resource', 'required', 'typical', 'various', 'attacker', 'adversary',
-                     'system', 'target', 'victim', 'user', 'application', 'network', 'service', 'protocol', 'data',
-                     'information', 'access', 'control', 'mechanism', 'security', 'ensure', 'prevent', 'detect',
-                     'response', 'implement', 'strategy', 'approach', 'method', 'process', 'result', 'effect', 'impact',
-                     'note', 'introduction', 'background', 'also', 'however', 'therefore']
+    # Lista ridotta per non cancellare verbi tecnici importanti
+    generic_terms = ['description', 'summary', 'details', 'content', 'reference', 'related', 'introduction', 'background']
     for term in generic_terms:
         text = re.sub(rf'\b{term}\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -408,145 +407,221 @@ def generate_llm_input(log_entry_or_session: Union[Dict, List[Dict]], honeypot_t
     return " ".join(desc_parts)
 
 # ==============================================================================
-# 4. DEFINIZIONE DELLE CLASSI PRINCIPALI
+# 4. DEFINIZIONE DELLE CLASSI PRINCIPALI (PARSING PROFONDO & BOOST)
 # ==============================================================================
 
 class CAPECPattern:
     def __init__(self, pattern_xml: ET.Element):
         self.id = pattern_xml.get('ID')
         self.name = pattern_xml.get('Name')
-        self.description = self._parse_description(pattern_xml)
-        self.execution_flow = self._parse_execution_flow(pattern_xml)
-        self.prerequisites = self._parse_generic_text_or_description(pattern_xml, 'capec:Prerequisites/capec:Prerequisite')
-        self.mitigations = self._parse_generic_text_or_description(pattern_xml, 'capec:Mitigations/capec:Mitigation')
-        self.likelihood = pattern_xml.findtext('capec:Likelihood_Of_Attack', default='Not Specified', namespaces=NS)
-        self.severity = pattern_xml.findtext('capec:Typical_Severity', default='Not Specified', namespaces=NS)
+        self.abstraction = pattern_xml.get('Abstraction') # Meta, Standard, Detailed
+        self.status = pattern_xml.get('Status')
+        
+        # 1. Base Descriptions
+        self.description = self._parse_block(pattern_xml, 'capec:Description')
+        self.extended_description = self._parse_block(pattern_xml, 'capec:Extended_Description')
+        
+        # 2. Execution Flow (Techniques) - Deep Parsing
+        self.techniques = []
+        flow = pattern_xml.find('capec:Execution_Flow', NS)
+        if flow is not None:
+            for step in flow.findall('.//capec:Attack_Step', NS):
+                step_desc = step.find('capec:Description', NS)
+                if step_desc is not None: self.techniques.append(self._clean_text(step_desc))
+                for tech in step.findall('capec:Technique', NS):
+                    self.techniques.append(self._clean_text(tech))
 
-    def _parse_text_from_complex_type(self, element: Optional[ET.Element]) -> str:
-        texts = []
-        if element is not None:
-            if element.text:
-                texts.append(element.text.strip())
-            for p in element.findall('.//xhtml:p', NS):
-                if p.text:
-                    texts.append(p.text.strip())
-        return full_preprocess(' '.join(filter(None, texts)))
+        # 3. Examples (Critical for BM25)
+        self.examples = []
+        examples_block = pattern_xml.find('capec:Example_Instances', NS)
+        if examples_block is not None:
+            for ex in examples_block.findall('capec:Example', NS):
+                self.examples.append(self._clean_text(ex))
+        
+        # 4. Alternate Terms
+        self.alternate_terms = []
+        alt_block = pattern_xml.find('capec:Alternate_Terms', NS)
+        if alt_block is not None:
+            for term in alt_block.findall('capec:Alternate_Term/capec:Term', NS):
+                if term.text: self.alternate_terms.append(term.text.strip())
 
-    def _parse_description(self, pattern: ET.Element) -> str:
-        desc_elem = pattern.find('capec:Description', NS)
-        return self._parse_text_from_complex_type(desc_elem)
+        # 5. Taxonomy Mappings (OWASP, ATT&CK, WASC)
+        self.taxonomy = []
+        tax_block = pattern_xml.find('capec:Taxonomy_Mappings', NS)
+        if tax_block is not None:
+            for tax in tax_block.findall('capec:Taxonomy_Mapping', NS):
+                entry_name = tax.find('capec:Entry_Name', NS)
+                if entry_name is not None and entry_name.text:
+                    self.taxonomy.append(entry_name.text.strip())
 
-    def _parse_generic_text_or_description(self, pattern: ET.Element, path: str) -> List[str]:
-        items = []
-        for elem in pattern.findall(path, NS):
-            desc_elem = elem.find('capec:Description', NS)
-            processed_text = self._parse_text_from_complex_type(desc_elem) if desc_elem is not None else full_preprocess(elem.text or '')
-            if processed_text:
-                items.append(processed_text)
-        return items
+        # 6. Prerequisites (Per Cross-Encoder)
+        self.prerequisites = []
+        prereq_block = pattern_xml.find('capec:Prerequisites', NS)
+        if prereq_block is not None:
+            for pre in prereq_block.findall('capec:Prerequisite', NS):
+                self.prerequisites.append(self._clean_text(pre))
 
-    def _parse_execution_flow(self, pattern: ET.Element) -> List[str]:
-        steps = []
-        flow_elem = pattern.find('capec:Execution_Flow', NS)
-        if flow_elem is not None:
-            for step in flow_elem.findall('.//capec:Attack_Step', NS):
-                processed_text = self._parse_text_from_complex_type(step.find('capec:Description', NS))
-                if processed_text:
-                    steps.append(processed_text)
-        return steps
+        # 7. Indicators (Per Cross-Encoder)
+        self.indicators = []
+        ind_block = pattern_xml.find('capec:Indicators', NS)
+        if ind_block is not None:
+            for ind in ind_block.findall('capec:Indicator', NS):
+                self.indicators.append(self._clean_text(ind))
 
-    def semantic_context(self) -> str:
+        # 8. Mitigations & CWE (Per Output Finale)
+        self.mitigations = []
+        mit_block = pattern_xml.find('capec:Mitigations', NS)
+        if mit_block is not None:
+            for mit in mit_block.findall('capec:Mitigation', NS):
+                self.mitigations.append(self._clean_text(mit))
+        
+        self.related_weaknesses = []
+        rel_weak_block = pattern_xml.find('capec:Related_Weaknesses', NS)
+        if rel_weak_block is not None:
+            for weak in rel_weak_block.findall('capec:Related_Weakness', NS):
+                cwe_id = weak.get('CWE_ID')
+                if cwe_id: self.related_weaknesses.append(f"CWE-{cwe_id}")
+
+    def _clean_text(self, element: Optional[ET.Element]) -> str:
+        if element is None: return ""
+        text_content = []
+        for text in element.itertext():
+            if text: text_content.append(text.strip())
+        return full_preprocess(" ".join(text_content))
+
+    def _parse_block(self, pattern, path):
+        elem = pattern.find(path, NS)
+        return self._clean_text(elem)
+
+    def get_bm25_text(self) -> str:
         parts = [
-            f"CAPEC {self.id}: {self.name}",
-            f"Description: {self.description}",
-            f"Execution Flow: {'; '.join(self.execution_flow) if self.execution_flow else 'Not specified'}",
-            f"Prerequisites: {'; '.join(self.prerequisites) if self.prerequisites else 'Not specified'}",
-            f"Likelihood: {self.likelihood}",
-            f"Severity: {self.severity}"
+            self.name, self.name, self.name,
+            " ".join(self.alternate_terms), " ".join(self.alternate_terms), " ".join(self.alternate_terms),
+            " ".join(self.examples), " ".join(self.examples),
+            " ".join(self.taxonomy), " ".join(self.taxonomy),
+            self.description,
+            " ".join(self.techniques)
         ]
-        return full_preprocess(' '.join(filter(None, parts)))
+        return " ".join(filter(None, parts))
+
+    def get_semantic_text(self) -> str:
+        parts = [
+            f"Attack Pattern Name: {self.name}",
+            f"Abstraction Level: {self.abstraction}",
+            f"Description: {self.description}",
+            f"Extended Details: {self.extended_description}",
+            f"Techniques and Steps: {'; '.join(self.techniques)}",
+            f"Real World Examples: {'; '.join(self.examples)}",
+            f"Indicators: {'; '.join(self.indicators)}"
+        ]
+        return " ".join(filter(None, parts))
 
     def to_metadata(self) -> Dict[str, Any]:
         return {
-            'id': str(self.id) if self.id else 'N/A',
-            'name': str(self.name) if self.name else 'N/A',
-            'description': str(self.description) if self.description else '',
-            'execution_flow': '; '.join(self.execution_flow) if self.execution_flow else '',
-            'prerequisites': '; '.join(self.prerequisites) if self.prerequisites else '',
-            'mitigations': '; '.join(self.mitigations) if self.mitigations else '',
-            'likelihood': str(self.likelihood) if self.likelihood else 'Not Specified',
-            'severity': str(self.severity) if self.severity else 'Not Specified'
+            'id': str(self.id),
+            'name': str(self.name),
+            'abstraction': str(self.abstraction),
+            'description': self.description[:500],
+            'prerequisites': " ".join(self.prerequisites),
+            'indicators': " ".join(self.indicators),
+            'mitigations': " | ".join(self.mitigations[:3]),
+            'related_cwe': ", ".join(self.related_weaknesses)
         }
 
 class VectorDBManager:
     def __init__(self):
-        print(f"\033[1;33m[DB] Inizializzazione SentenceTransformer ({EMBEDDING_MODEL})...\033[0m")
+        print(f"\033[1;33m[DB] Inizializzazione Embedding SOTA ({EMBEDDING_MODEL})...\033[0m")
         self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+        
+        if os.path.exists(CHROMA_DB_PATH):
+            print(f"[DB] Pulizia directory database {CHROMA_DB_PATH}...")
+            try:
+                shutil.rmtree(CHROMA_DB_PATH)
+            except Exception as e:
+                print(f"[WARNING] Impossibile cancellare DB: {e}")
+
         print(f"\033[1;33m[DB] Connessione a ChromaDB ({CHROMA_DB_PATH})...\033[0m")
         self.client = chromadb.PersistentClient(path=CHROMA_DB_PATH, settings=Settings(anonymized_telemetry=False, allow_reset=True))
-        self.collection, self.tfidf_vectorizer, self.tfidf_matrix, self.capec_ids, self.capec_metadata_map = None, None, None, [], {}
+        self.collection = None
+        self.bm25 = None
+        self.capec_ids = []
+        self.capec_metadata_map = {}
 
     def initialize_db(self, patterns: List[CAPECPattern]):
         print(f"\033[1;36m{'=' * 80}\033[0m")
-        print(f"\033[1;33m[DB] Inizializzazione del database vettoriale...\033[0m")
-        try:
-            collection_name = "capec_collection"
-            try:
-                self.client.delete_collection(name=collection_name)
-                print("[DB] Collezione precedente rimossa.")
-            except Exception: pass
-            self.collection = self.client.create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
-            print(f"\033[1;32m[DB] Collezione '{collection_name}' creata.\033[0m")
+        print(f"\033[1;33m[DB] Inizializzazione del database vettoriale + BM25...\033[0m")
+        
+        collection_name = "capec_bge_m3_final_v5"
+        self.collection = self.client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
 
-            contexts = [p.semantic_context() for p in patterns]
+        if self.collection.count() == 0:
+            print("[DB] Generazione contesti Ottimizzati (Semantic & Keyword)...")
+            semantic_contexts = [p.get_semantic_text() for p in patterns]
+            bm25_contexts = [p.get_bm25_text() for p in patterns]
+            
             self.capec_ids = [p.id for p in patterns]
             metadatas = [p.to_metadata() for p in patterns]
             self.capec_metadata_map = {p.id: meta for p, meta in zip(patterns, metadatas)}
 
-            self.tfidf_vectorizer = TfidfVectorizer(tokenizer=get_enhanced_tokens, preprocessor=full_preprocess, max_df=0.85, min_df=2, ngram_range=(1, 3), stop_words='english')
-            self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(contexts)
-            print("[DB] Matrice TF-IDF calcolata.")
+            print("[DB] Costruzione indice BM25...")
+            tokenized_corpus = [get_enhanced_tokens(ctx) for ctx in bm25_contexts]
+            self.bm25 = BM25Okapi(tokenized_corpus)
 
-            all_embeddings = self.embedder.encode(contexts, batch_size=32, show_progress_bar=True, normalize_embeddings=True)
-            print(f"\033[1;32m[DB] Embeddings calcolati.\033[0m")
-
-            db_batch_size = 500
+            print(f"[DB] Calcolo embeddings densi con {EMBEDDING_MODEL}...")
+            all_embeddings = self.embedder.encode(semantic_contexts, batch_size=16, show_progress_bar=True, normalize_embeddings=True)
+            
+            db_batch_size = 200
             for i in tqdm(range(0, len(self.capec_ids), db_batch_size), desc="[DB] Aggiunta a Chroma"):
                 self.collection.add(
                     ids=self.capec_ids[i:i + db_batch_size],
                     embeddings=[e.tolist() for e in all_embeddings[i:i + db_batch_size]],
-                    documents=contexts[i:i + db_batch_size],
+                    documents=semantic_contexts[i:i + db_batch_size], 
                     metadatas=metadatas[i:i + db_batch_size]
                 )
-            print(f"\033[1;32m[DB] Database inizializzato! ({self.collection.count()} elementi)\033[0m")
-        except Exception as e:
-            print(f"\033[1;31m[ERRORE] Inizializzazione DB fallita: {e}\033[0m"); traceback.print_exc(); raise
+        else:
+            print("[DB] Database esistente trovato. Caricamento indici...")
+            data = self.collection.get()
+            contexts = data['documents']
+            self.capec_ids = data['ids']
+            metadatas = data['metadatas']
+            self.capec_metadata_map = {id_: meta for id_, meta in zip(self.capec_ids, metadatas)}
+            
+            print("[DB] Ricostruzione BM25...")
+            tokenized_corpus = [get_enhanced_tokens(ctx) for ctx in contexts]
+            self.bm25 = BM25Okapi(tokenized_corpus)
+
+        print(f"\033[1;32m[DB] Database inizializzato! ({self.collection.count()} elementi)\033[0m")
         print(f"\033[1;36m{'=' * 80}\033[0m")
 
-    def compute_keyword_similarity(self, query: str) -> Dict[str, float]:
-        query_vec = self.tfidf_vectorizer.transform([full_preprocess(query)])
-        cos_sim = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        return {self.capec_ids[i]: float(cos_sim[i]) for i in range(len(self.capec_ids))}
-
-    def query_semantic_top_k(self, query_embedding: np.ndarray, top_k: int) -> Dict[str, float]:
-        results = self.collection.query(query_embeddings=[query_embedding.tolist()], n_results=top_k)
-        ids, distances = results.get('ids', [[]])[0], results.get('distances', [[]])[0]
-        return {ids[i]: 1.0 - distances[i] for i in range(len(ids))} if ids and distances is not None else {}
+    def compute_bm25_scores(self, query: str) -> Dict[str, float]:
+        tokenized_query = get_enhanced_tokens(query)
+        if not tokenized_query: return {}
+        
+        scores = self.bm25.get_scores(tokenized_query)
+        max_score = np.max(scores) if len(scores) > 0 else 0
+        if max_score > 0:
+            scores = scores / max_score
+            
+        return {self.capec_ids[i]: float(scores[i]) for i in range(len(self.capec_ids))}
 
 # ==============================================================================
-# MODIFICA: Implementazione di Reciprocal Rank Fusion (RRF)
+# 5. HYBRID ANALYZER (RRF + CROSS-ENCODER + ABSTRACTION BOOST)
 # ==============================================================================
 class HybridAnalyzer:
     def __init__(self, k_rrf: int = 60):
         self.embedder = SentenceTransformer(EMBEDDING_MODEL)
+        print(f"\033[1;33m[ANALYZER] Inizializzazione Cross-Encoder ({CROSS_ENCODER_MODEL})...\033[0m")
+        self.cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
         self.k_rrf = k_rrf
 
     def _get_query_text_from_llm(self, llm_analysis: Dict) -> str:
-        return full_preprocess(' '.join(filter(None, [
-            llm_analysis.get('pattern_name', ''),
-            llm_analysis.get('detailed_description', ''),
-            ' '.join(llm_analysis.get('technical_keywords', []))
-        ])))
+        concept_signal = f"{llm_analysis.get('pattern_name', '')} {llm_analysis.get('summary_description', '')} {llm_analysis.get('extended_description', '')}"
+        action_signal = f"{llm_analysis.get('technical_actions', '')} {llm_analysis.get('payload_sample', '')}"
+        context_signal = f"{llm_analysis.get('prerequisites', '')}"
+        keywords = " ".join(llm_analysis.get('technical_keywords', []))
+        
+        full_query = f"{concept_signal} {action_signal} {context_signal} {keywords}"
+        return full_preprocess(full_query)
 
     def analyze(self, llm_input_description: str, honeypot_type: str, db_manager: VectorDBManager, top_k: int = 5) -> Dict[str, Any]:
         llm_analysis = _generate_llm_analysis(llm_input_description, honeypot_type)
@@ -556,15 +631,13 @@ class HybridAnalyzer:
             'llm_input_description': llm_input_description,
             'llm_analysis': llm_analysis,
             'db_matches': [],
-            'debug_candidates': []
+            'rrf_candidates': [] # Nuova chiave per salvare lo stato pre-rerank
         }
 
         if not query_text: return result_dict
 
-        # --- FASE 1: OTTENERE LE LISTE ORDINATE SEPARATAMENTE ---
+        # --- FASE 1: RETRIEVAL IBRIDO ---
         CANDIDATE_COUNT = 100
-
-        # Ricerca Semantica
         query_embedding = self.embedder.encode(query_text, normalize_embeddings=True)
         semantic_results = db_manager.collection.query(
             query_embeddings=[query_embedding.tolist()],
@@ -573,225 +646,86 @@ class HybridAnalyzer:
         semantic_ids = semantic_results.get('ids', [[]])[0]
         semantic_rank_map = {doc_id: i + 1 for i, doc_id in enumerate(semantic_ids)}
 
-        # Ricerca Keyword
-        all_keyword_scores = db_manager.compute_keyword_similarity(query_text)
-        sorted_keyword_ids = [k for k, v in sorted(all_keyword_scores.items(), key=lambda item: item[1], reverse=True)]
-        keyword_rank_map = {doc_id: i + 1 for i, doc_id in enumerate(sorted_keyword_ids)}
+        bm25_scores = db_manager.compute_bm25_scores(query_text)
+        sorted_bm25 = sorted(bm25_scores.items(), key=lambda x: x[1], reverse=True)[:CANDIDATE_COUNT]
+        bm25_ids = [x[0] for x in sorted_bm25]
+        bm25_rank_map = {doc_id: i + 1 for i, doc_id in enumerate(bm25_ids)}
 
-        all_candidate_ids = set(semantic_ids) | set(sorted_keyword_ids[:CANDIDATE_COUNT])
-
+        all_candidate_ids = set(semantic_ids) | set(bm25_ids)
         if not all_candidate_ids: return result_dict
 
-        # --- FASE 2: APPLICARE RECIPROCAL RANK FUSION (RRF) ---
+        # --- FASE 2: RRF CON ABSTRACTION BOOST ---
         fused_scores = defaultdict(float)
         for doc_id in all_candidate_ids:
+            rrf_val = 0
             if doc_id in semantic_rank_map:
-                fused_scores[doc_id] += 1 / (self.k_rrf + semantic_rank_map[doc_id])
-            if doc_id in keyword_rank_map:
-                fused_scores[doc_id] += 1 / (self.k_rrf + keyword_rank_map[doc_id])
+                rrf_val += 1 / (self.k_rrf + semantic_rank_map[doc_id])
+            if doc_id in bm25_rank_map:
+                rrf_val += 1 / (self.k_rrf + bm25_rank_map[doc_id])
+            
+            meta = db_manager.capec_metadata_map.get(doc_id, {})
+            abstraction = meta.get('abstraction', 'Standard')
+            boost = 1.0
+            if abstraction == 'Detailed': boost = 1.2
+            elif abstraction == 'Meta': boost = 0.8
+            
+            fused_scores[doc_id] = rrf_val * boost
 
         sorted_fused_ids = sorted(fused_scores.keys(), key=lambda doc_id: fused_scores[doc_id], reverse=True)
 
-        # --- FASE 3: COSTRUIRE I RISULTATI PER L'OUTPUT E IL DEBUG ---
-        debug_candidates_list = []
-        for rank, capec_id in enumerate(sorted_fused_ids[:20]):
+        # Creazione lista candidati
+        TOP_N_RERANK = 30
+        candidates_list = []
+        
+        for capec_id in sorted_fused_ids[:TOP_N_RERANK]:
              if (metadata := db_manager.capec_metadata_map.get(capec_id)):
                 candidate_data = {
                     'capec_id': capec_id,
                     'pattern': metadata['name'],
-                    'confidence': fused_scores[capec_id],
-                    'semantic_rank': semantic_rank_map.get(capec_id, 'N/A'),
-                    'keyword_rank': keyword_rank_map.get(capec_id, 'N/A'),
-                    'metadata': metadata
+                    'confidence': fused_scores[capec_id], # Qui è ancora score RRF
+                    'semantic_rank': semantic_rank_map.get(capec_id, '-'),
+                    'bm25_rank': bm25_rank_map.get(capec_id, '-'),
+                    'metadata': metadata,
+                    'rrf_score': fused_scores[capec_id],
+                    'cross_score': 0.0 # Placeholder
                 }
-                debug_candidates_list.append(candidate_data)
+                candidates_list.append(candidate_data)
+        
+        # SALVIAMO LO STATO RRF ORA (Copia profonda non necessaria, basta una nuova lista)
+        # Questo serve per il debug: vediamo l'ordine PRIMA che il Cross-Encoder lo tocchi
+        result_dict['rrf_candidates'] = list(candidates_list)
 
-        result_dict['db_matches'] = debug_candidates_list[:top_k]
-        result_dict['debug_candidates'] = debug_candidates_list
+        # --- FASE 3: RE-RANKING CON CROSS-ENCODER ---
+        if candidates_list:
+            pairs = []
+            for cand in candidates_list:
+                meta = cand['metadata']
+                # Costruiamo un "Documento Ricco" per il Cross-Encoder per il confronto
+                doc_rich_text = (
+                    f"Pattern: {cand['pattern']}. "
+                    f"Description: {meta['description']} "
+                    f"Prerequisites: {meta.get('prerequisites', '')} "
+                    f"Indicators: {meta.get('indicators', '')}"
+                )
+                pairs.append([query_text, doc_rich_text])
+            
+            cross_scores = self.cross_encoder.predict(pairs)
+            
+            for i, cand in enumerate(candidates_list):
+                cand['cross_score'] = float(cross_scores[i])
+                # Aggiorniamo la confidence principale col Cross-Score
+                cand['confidence'] = float(cross_scores[i])
+            
+            # Riordiniamo la lista principale (db_matches) basandoci sul Cross-Score
+            candidates_list.sort(key=lambda x: x['cross_score'], reverse=True)
+
+        result_dict['db_matches'] = candidates_list[:top_k]
 
         return result_dict
 
 # ==============================================================================
-# 5. LOGICA DI INTERAZIONE CON LLM
+# 6. LOGICA DI INTERAZIONE CON LLM (LLAMA 3.1 NATIVE PROMPTING)
 # ==============================================================================
-
-def _get_llm_prompt(event_input_description: str, honeypot_type: str) -> str:
-    base_template = """<s>[INST]
-### Your Role: Threat Intelligence Lexicographer
-You are an AI tasked with defining cybersecurity attack patterns for a formal knowledge base like CAPEC. Your role is **not to narrate a specific event**, but to provide a formal, abstract, and encyclopedic **DEFINITION** of a single attack technique, demonstrating deep contextual understanding.
-
-### Core Mission: Identify the Apex Threat and Define It
-1.  **Identify the Apex Threat**: From the input log, identify the single most severe and significant action (e.g., Remote Code Execution, Application Fingerprinting, Credential Brute-Forcing). This is the *only* technique you will define.
-2.  **Define the Technique**: Write a formal, general-purpose definition of that technique.
-
-### Chain-of-Thought Process
-You MUST follow this internal reasoning process for ALL tasks:
-1.  **Evidence Ingestion**: List all actions and inputs explicitly mentioned in the log.
-2.  **Input Validity Check**: Critically evaluate if inputs are contextually valid for their actions.
-3.  **Intent Inference**: Determine the *true intent* of each action. An action labeled 'failed login' with an invalid username is not 'Credential Access', it is 'Reconnaissance'.
-4.  **Apex Threat Identification**: Using the `Threat Hierarchy` and `Context-Specific Rules`, identify the single action with the most severe *true intent*.
-5.  **Contextual Coherence Check**: Ask: "Is the inferred intent logically possible given the context?" (e.g., 'Privilege Escalation' is impossible if the user is already 'root'). Correct your analysis if it's illogical.
-6.  **Abstraction & Definition**: Formulate a completely abstract definition of the *corrected* Apex Threat.
-
-### Threat Hierarchy (Highest to Lowest Priority)
-1.  **Execution**: Any form of code or command execution.
-2.  **Credential Access**: Attempts to use, steal, or guess credentials.
-3.  **Reconnaissance & Discovery**: All other information gathering activities.
-
-### Critical Rules
--   **RULE 1 (EVIDENCE-BOUND REASONING)**: You MUST NOT infer actions not present in the log. If the log only shows `GET` requests, you cannot infer a `Brute Force` attack.
--   **RULE 2 (DO NOT SUMMARIZE)**: Your `detailed_description` MUST be a formal DEFINITION of the technique, not a summary of the log's events.
--   **RULE 3 (STRICT ABSTRACTION)**: The `detailed_description` and `technical_keywords` MUST NOT contain any specific details from the logs (commands, filenames, tools, etc.).
--   **RULE 4 (LOGICAL COHERENCE)**: Your analysis must be logically consistent. DO NOT classify an action with an intent that is already fulfilled. For example, **DO NOT classify an action as 'Privilege Escalation' if the user already has root/administrator privileges.**
-
-### Output JSON Structure
-Your output must be ONLY a single valid JSON object with these four keys:
--   `"pattern_name"`: Formal name as 'Broad Category: Specific Technique'.
--   `"detailed_description"`: The formal, abstract, textbook-style definition of the Apex Threat.
--   `"technical_keywords"`: A list of 8-10 abstract concepts related to the technique.
--   `"justification"`: The ONLY field where you must cite the specific evidence for the Apex Threat.
-"""
-
-    context_str, example_str = "", ""
-
-    if honeypot_type == 'Cowrie':
-        context_str = """
-### Honeypot Context: Cowrie
--   **Input Type**: Interactive SSH/Telnet session logs.
--   **Context-Specific Rules**:
-    1.  The execution of any script or binary (`sh`, `bash`, `./filename`) or the use of a download utility (`wget`, `curl`) is ALWAYS the Apex Threat (Execution).
-    2.  If no execution occurs, a sequence of commands for system enumeration (`ifconfig`, `uname`, `ps`, `cat /proc/...`) is the Apex Threat (Reconnaissance).
-    3.  A failed login with a non-human-readable username (e.g., an HTTP request) is `Application Fingerprinting`, NOT `Brute Force`."""
-        example_str = """
-
-### Example
-**Input Log:**
-`Interactive SSH session. Login succeeded as 'pi'. Commands: ["uname -r", "ifconfig", "ps aux"].`
-**Output JSON:**
-```json
-{{
-  "pattern_name": "Reconnaissance: System Information Gathering",
-  "detailed_description": "System Information Gathering is a technique where an adversary executes a series of built-in commands to obtain detailed information about a host's configuration. This can include discovering the operating system version, network interfaces, and running processes. This activity allows the adversary to map the system's environment to plan subsequent actions.",
-  "technical_keywords": ["reconnaissance", "discovery", "system information gathering", "os fingerprinting", "network configuration discovery", "process discovery", "host enumeration", "post-exploitation"],
-  "justification": "The sequence of commands including 'uname -r', 'ifconfig', and 'ps aux' is the definitive evidence of a system information gathering technique."
-}}
-```"""
-
-    elif honeypot_type == 'Honeytrap':
-        context_str = """
-### Honeypot Context: Honeytrap
--   **Input Type**: Network connection summary.
--   **Context-Specific Rules**:
-    1.  A payload containing shell commands (`rm`, `wget`, etc.) within a URL is ALWAYS the Apex Threat (Execution: Command Injection).
-    2.  If no command injection is present, a payload that is a valid HTTP request targeting a known vulnerability path (e.g., `/.env`, `/setup.cgi`) is the Apex Threat (Reconnaissance: Vulnerability Probing).
-    3.  Payloads identified as TLS Handshakes or simple HTTP requests to `/` are basic `Service Discovery` (Reconnaissance)."""
-        example_str = """
-
-### Example
-**Input Log:**
-`Observed 10 TCP attempts. 1 had a payload. Example Payloads: ["GET /.env HTTP/1.1"]`
-**Output JSON:**
-```json
-{{
-  "pattern_name": "Reconnaissance: Sensitive File Discovery",
-  "detailed_description": "Sensitive File Discovery is a reconnaissance technique where an adversary sends HTTP requests to probe for well-known configuration or environment files that may contain credentials, API keys, or other sensitive data. This automated activity targets common file paths to identify misconfigurations and gather information for further exploitation.",
-  "technical_keywords": ["reconnaissance", "information gathering", "sensitive data exposure", "configuration file access", "http get", "vulnerability scanning", "web application mapping", "path traversal"],
-  "justification": "The GET request targeting the '/.env' file, a common location for sensitive environment variables, is the key evidence of this technique."
-}}
-```"""
-    
-    elif honeypot_type == 'Dionaea':
-        context_str = """
-### Honeypot Context: Dionaea
--   **Input Type**: Emulated service interaction summary.
--   **Context-Specific Rules**:
-    1.  The capture of specific credentials for a high-value service (e.g., 'sa' for mssql, 'root' for mysql) is ALWAYS the Apex Threat (Credential Access).
-    2.  An FTP command sequence that involves more than just login (e.g., `LIST`, `STOR`, `RETR`) is the next most severe threat (Reconnaissance or Execution).
-    3.  Simple connection attempts across multiple ports are `Service Discovery` (Reconnaissance)."""
-        example_str = """
-
-### Example
-**Input Log:**
-`Observed 15 connection attempts targeting 'mssqld' and 'smbd'. Credentials were captured. Summary: ["service: mssqld, user: 'sa'"].`
-**Output JSON:**
-```json
-{{
-  "pattern_name": "Credential Access: Database Authentication Probing",
-  "detailed_description": "Database Authentication Probing is a form of credential stuffing where an adversary attempts to gain unauthorized access to a database service. The technique involves authenticating with common, default, or previously compromised administrative credentials. This action is distinct from simple service discovery, as it represents a direct attempt to compromise an account on a high-value target.",
-  "technical_keywords": ["credential access", "brute-force", "service discovery", "database security", "authentication bypass", "credential stuffing", "default credentials", "reconnaissance"],
-  "justification": "The capture of the 'sa' username for the mssqld service was the key evidence that elevated this activity from a simple scan to a targeted credential attack."
-}}
-```"""
-        
-    elif honeypot_type == 'Sentrypeer':
-        context_str = """
-### Honeypot Context: Sentrypeer
--   **Input Type**: SIP/VoIP interaction summary.
--   **Context-Specific Rules**:
-    1.  A `REGISTER` request is ALWAYS the Apex Threat (Credential Access: Registration Hijacking).
-    2.  A high volume of `INVITE` requests with sequential or patterned numbers is the Apex Threat (Reconnaissance: Dial Plan Enumeration).
-    3.  A single `INVITE` to an international number is a potential `Toll Fraud` attempt (Execution).
-    4.  `OPTIONS` requests, even with known scanner UAs, are the lowest priority threat (Reconnaissance: Endpoint Discovery)."""
-        example_str = """
-
-### Example
-**Input Log:**
-`Observed 2 SIP interaction(s), using method(s): REGISTER. User-Agent(s) observed: ["friendly-scanner"]. Target numbers/extensions observed: ["1000"].`
-**Output JSON:**
-```json
-{{
-  "pattern_name": "Credential Access: SIP Registration Hijacking Attempt",
-  "detailed_description": "SIP Registration Hijacking is a credential access technique where an adversary attempts to register a user agent to a SIP registrar on behalf of a legitimate user. By sending crafted REGISTER requests, the attacker aims to associate their own location with the victim's SIP address, allowing them to intercept incoming calls or make fraudulent calls. This is a direct attempt to compromise an account.",
-  "technical_keywords": ["credential access", "sip protocol", "voip security", "registration hijacking", "account takeover", "man-in-the-middle", "authentication bypass", "session initiation"],
-  "justification": "The use of the SIP 'REGISTER' method is the key evidence, as its primary purpose is to authenticate and register an endpoint, making it an Apex Threat over simple discovery."
-}}
-```"""
-        
-    elif honeypot_type == 'Ciscoasa':
-        context_str = """
-### Honeypot Context: Ciscoasa
--   **Input Type**: HTTP request sequence summary.
--   **Context-Specific Rules**:
-    1.  A request targeting a known, specific vulnerability or administrative path (e.g., '/+CSCOE+/', '/remote/logincheck') is ALWAYS the Apex Threat (Reconnaissance: Specific Service Discovery).
-    2.  DO NOT infer a Brute Force attack from a single `GET` request to a login path. This is Reconnaissance. Brute Force can only be inferred from a high volume of `POST` requests.
-    3.  Generic requests (`GET /`) are the lowest priority."""
-        example_str = """
-
-### Example
-**Input Log:**
-`2 unique HTTP request(s) were observed. HTTP Request Sequence: ["GET /", "GET /.git/config"]`
-**Output JSON:**
-```json
-{{
-  "pattern_name": "Reconnaissance: Sensitive File Discovery via Web Path",
-  "detailed_description": "Sensitive File Discovery is a reconnaissance technique where an adversary sends HTTP requests to probe for well-known files that contain sensitive system or application data. Targeting common paths like version control system directories (e.g., '/.git/') can expose source code, configuration details, or credentials, providing valuable information for further exploitation.",
-  "technical_keywords": ["reconnaissance", "information gathering", "sensitive data exposure", "version control system", "http get", "vulnerability scanning", "web application mapping", "source code disclosure"],
-  "justification": "The GET request targeting the '/.git/config' file is the key evidence of an attempt to access sensitive configuration data."
-}}
-```"""
-    
-    else:
-        context_str = ""
-        example_str = ""
-    
-    final_prompt_template = (
-        base_template + 
-        context_str + 
-        example_str +
-        """
-
-Now, analyze the following real log data, strictly adhering to all general and context-specific rules.
-
-**Input Log:**
-`{event_input_description}`
-
-**Output JSON:**
-```json
-[/INST]
-"""
-    )
-    
-    return final_prompt_template.format(event_input_description=event_input_description)
 
 tokenizer = None
 llm_pipeline = None
@@ -801,41 +735,136 @@ def _generate_llm_analysis(event_input_description: str, honeypot_type: str) -> 
     if not llm_pipeline or not tokenizer:
         return {"pattern_name": "N/A", "detailed_description": "LLM Not Initialized", "technical_keywords": [], "justification": ""}
 
-    prompt = _get_llm_prompt(event_input_description, honeypot_type)
+    # 1. Regole Contestuali (Dal tuo VECCHIO prompt, preservando la logica specifica)
+    context_instructions = ""
+    if honeypot_type == 'Cowrie':
+        context_instructions = """
+### CONTEXT: Cowrie (SSH/Telnet Honeypot)
+- **Execution Rule:** If `wget`, `curl`, `chmod` or specific binaries (`./bot`) are seen, this is EXECUTION (Highest Priority).
+- **Recon Rule:** If only commands like `uname`, `cat /proc/cpuinfo` are seen, this is RECONNAISSANCE.
+- **Login Rule:** Failed logins with non-human usernames (e.g., 'GET /') are FINGERPRINTING, not Brute Force."""
+    
+    elif honeypot_type == 'Honeytrap':
+        context_instructions = """
+### CONTEXT: Honeytrap (Network Listener)
+- **Payload Rule:** If specific hex payloads are decoded into shell commands, this is EXECUTION.
+- **Exploit Rule:** Known exploit signatures (e.g., EternalBlue hex patterns) are EXPLOITATION.
+- **Scanning Rule:** Empty connections or generic TLS handshakes are DISCOVERY."""
+
+    elif honeypot_type == 'Dionaea':
+        context_instructions = """
+### CONTEXT: Dionaea (Malware Capture)
+- **Credential Rule:** Capturing 'sa' (MSSQL) or 'root' (MySQL) credentials is CREDENTIAL ACCESS.
+- **Malware Rule:** If a binary is uploaded (SMB/FTP), this is DELIVERY/EXECUTION.
+- **Scanning Rule:** Connection attempts without payloads are DISCOVERY."""
+
+    elif honeypot_type == 'Sentrypeer':
+        context_instructions = """
+### CONTEXT: Sentrypeer (VoIP/SIP)
+- **Hijacking Rule:** `REGISTER` requests indicate SIP Account Hijacking (High Severity).
+- **Enumeration Rule:** Sequential `INVITE` attempts indicate Extension Enumeration.
+- **Fraud Rule:** `INVITE` to international numbers indicates Toll Fraud."""
+
+    elif honeypot_type == 'Ciscoasa':
+        context_instructions = """
+### CONTEXT: CiscoASA (Web Simulation)
+- **Web Recon Rule:** Requests to `/+CSCOE+/` or `/remote/logincheck` are SPECIFIC SERVICE DISCOVERY.
+- **No Brute Force:** Do not classify single GET requests as Brute Force."""
+
+    # 2. SYSTEM PROMPT IBRIDO (Logica Vecchia + Struttura Nuova)
+    system_prompt = f"""You are a Threat Intelligence Expert tasked with mapping raw logs to the MITRE CAPEC framework.
+
+### CORE MISSION: IDENTIFY THE APEX THREAT
+You must analyze the log and identify the **single most severe intent**.
+**Threat Hierarchy (Highest to Lowest):**
+1. **Execution/Exploitation:** Code execution, malware download, command injection.
+2. **Credential Access:** Successful logins, credential dumping, stealing tokens.
+3. **Reconnaissance:** Scanning, fingerprinting, failed login attempts.
+
+### ANALYSIS PROCESS (Chain of Thought)
+1. **Ingest:** Read the raw log data and context.
+2. **Validate:** Is the input valid for the protocol? (e.g. 'GET /' as a username is not a user, it's a protocol mismatch scan).
+3. **Prioritize:** If you see both Scanning and Execution, classify as **EXECUTION**.
+4. **Abstract:** Define the technique using formal MITRE language (e.g. "Adversary", "Target"), not conversational language.
+
+{context_instructions}
+
+### ANTI-POISONING RULES
+- **NO Hallucinations:** Do not infer attacks not present in the log (e.g. don't say "SQL Injection" if it's an OS shell command).
+- **NO Future/Past:** Describe only the mechanism visible in the log, not what *might* happen next.
+
+### OUTPUT FORMAT
+Provide a single JSON object.
+{{
+  "_reasoning": "Explain your logic here. Why did you choose this Apex Threat? What did you discard?",
+  "pattern_name": "CAPEC-Style Title (e.g. 'OS Command Injection')",
+  "summary_description": "A concise, 1-sentence abstract definition of the attack pattern.",
+  "extended_description": "A detailed, encyclopedic description of how this technique works generally (not just this log). Use formal tone.",
+  "technical_actions": "List specific technical actions found in the log (e.g. 'Inject command delimiters', 'Use wget').",
+  "payload_sample": "Extract the specific command, hex snippet, or filename from the log.",
+  "prerequisites": "What state must the system be in for this attack to work?",
+  "technical_keywords": ["keyword1", "keyword2", "keyword3"],
+  "justification": "One sentence citing the specific evidence from the log."
+}}
+"""
+
+    # 3. USER PROMPT
+    user_prompt = f"""Analyze the following log entry:
+
+<log_data>
+{event_input_description}
+</log_data>
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
 
     try:
-        response = llm_pipeline(prompt, max_new_tokens=1500, temperature=0.1, top_p=0.9, do_sample=True, repetition_penalty=1.1,
-                                 pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)[0]['generated_text']
+        prompt_formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        outputs = llm_pipeline(
+            prompt_formatted, 
+            max_new_tokens=1000, 
+            temperature=0.1,    
+            top_p=0.9, 
+            do_sample=True,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        
+        response = outputs[0]['generated_text'][len(prompt_formatted):].strip()
         return _parse_llm_response(response)
     except Exception as e:
-        print(f"\033[1;31m[ERRORE] Chiamata pipeline LLM fallita: {e}\033[0m")
-        return {"pattern_name": "N/A", "detailed_description": f"LLM Pipeline Error: {e}", "technical_keywords": [], "justification": ""}
+        print(f"\033[1;31m[ERRORE] LLM: {e}\033[0m")
+        return {}
 
 def _parse_llm_response(response: str) -> Dict[str, Any]:
     try:
-        inst_end_tag = "[/INST]"
-        if inst_end_tag in response:
-            response = response.split(inst_end_tag, 1)[-1].strip()
-
         start = response.find('{')
-        end = response.rfind('}')
-        if start == -1 or end == -1 or end < start:
-            return {"pattern_name": "N/A", "detailed_description": f"LLM Parsing Error: No JSON block found. Response: {response[:500]}", "technical_keywords": [], "justification": ""}
-
-        json_str = response[start:end + 1]
-        parsed = json.loads(json_str)
-
+        end = response.rfind('}') + 1
+        if start == -1 or end == 0: return {}
+        
+        json_str = response[start:end]
+        data = json.loads(json_str)
+        
         return {
-            'pattern_name': str(parsed.get('pattern_name', 'N/A')),
-            'detailed_description': str(parsed.get('detailed_description', '')),
-            'technical_keywords': [str(item) for item in parsed.get('technical_keywords', []) if isinstance(parsed.get('technical_keywords'), list)],
-            'justification': str(parsed.get('justification', ''))
+            'pattern_name': data.get('pattern_name', 'Unknown'),
+            'summary_description': data.get('summary_description', ''),
+            'detailed_description': data.get('abstract_definition', data.get('extended_description', '')),
+            'extended_description': data.get('extended_description', ''),
+            'technical_actions': data.get('technical_actions', ''),
+            'payload_sample': data.get('payload_sample', ''),
+            'prerequisites': data.get('prerequisites', ''),
+            'technical_keywords': data.get('technical_keywords', []),
+            'justification': data.get('justification', '')
         }
-    except (json.JSONDecodeError, Exception) as e:
-        return {"pattern_name": "N/A", "detailed_description": f"LLM Parsing Error: {e}. Raw response: {response[:500]}", "technical_keywords": [], "justification": ""}
+    except Exception:
+        return {}
 
 # ==============================================================================
-# 6. FUNZIONI DI INIZIALIZZAZIONE E STAMPA
+# 7. FUNZIONI DI INIZIALIZZAZIONE E STAMPA AGGIORNATE
 # ==============================================================================
 
 def initialize_system():
@@ -844,101 +873,93 @@ def initialize_system():
         print(f"\033[1;31m[ERRORE] File CAPEC '{CAPEC_XML_FILE}' non trovato.\033[0m"); exit()
 
     print(f"\033[1;44m--- INIZIO CONFIGURAZIONE SISTEMA --- \033[0m")
-
-    print(f"\033[1;33m[CONFIGURAZIONE] Caricamento CAPEC da: {CAPEC_XML_FILE}\033[0m")
     try:
         tree = ET.parse(CAPEC_XML_FILE)
         patterns = [CAPECPattern(e) for e in tree.findall('.//capec:Attack_Pattern', NS)]
-        print(f"\033[1;32m[CONFIGURAZIONE] {len(patterns)} pattern CAPEC caricati.\033[0m")
-    except ET.ParseError as e:
-        print(f"\033[1;31m[ERRORE] Parsing CAPEC XML fallito: {e}\033[0m"); exit()
+        print(f"\033[1;32m[CONFIG] {len(patterns)} pattern CAPEC caricati.\033[0m")
+    except ET.ParseError as e: print(f"\033[1;31m[ERRORE] Parsing CAPEC XML fallito: {e}\033[0m"); exit()
 
-    print(f"\033[1;33m[CONFIGURAZIONE] Configurazione LLM locale: {LLM_MODEL}...\033[0m")
+    print(f"\033[1;33m[CONFIG] Configurazione LLM: {LLM_MODEL}...\033[0m")
     try:
-        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16)
         tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
         if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-
-        device_map = "auto" if torch.cuda.is_available() else {"": "cpu"}
-        print(f"[CONFIGURAZIONE] Uso della device map: {device_map}")
-
-        model = AutoModelForCausalLM.from_pretrained(LLM_MODEL, quantization_config=bnb_config, device_map=device_map, torch_dtype=torch.bfloat16, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(LLM_MODEL, quantization_config=bnb_config, device_map="auto", trust_remote_code=True)
         llm_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
-        print(f"\033[1;32m[CONFIGURAZIONE] Pipeline LLM creata con successo.\033[0m")
-    except Exception as e:
-        print(f"\033[1;31m[ERRORE] Inizializzazione LLM locale fallita: {e}\033[0m")
-        print("\033[1;33m[SUGGERIMENTO] Assicurati che 'torch', 'transformers', 'accelerate', 'bitsandbytes', 'scipy' siano installati e che ci sia abbastanza VRAM.\033[0m"); exit()
+        print(f"\033[1;32m[CONFIG] Pipeline LLM creata con successo.\033[0m")
+    except Exception as e: print(f"\033[1;31m[ERRORE] Init LLM fallita: {e}\033[0m. Prova `huggingface-cli login`."); exit()
 
     db_manager = VectorDBManager()
     db_manager.initialize_db(patterns)
     analyzer = HybridAnalyzer(k_rrf=60)
-
     print(f"\033[1;42m--- CONFIGURAZIONE COMPLETATA --- \033[0m")
     return analyzer, db_manager
 
 def print_analysis_result(result: Dict, honeypot_type: str, identifier: str, top_k: int):
     src_ip = result.get('src_ip', 'N/A')
+    llm = result.get('llm_analysis', {})
 
-    print(f"\n\033[1;44m{'='*15} 🔍 ANALISI PER: {identifier} ({honeypot_type.upper()}) {'='*15}\033[0m")
-    print(f"\033[1;34mSorgente Attacco (SRC IP):\033[0m \033[1;37m{src_ip}\033[0m")
-    print("\033[90m" + "-"*80 + "\033[0m")
+    print(f"\n\033[1;44m{'='*20} 🛡️  ANALISI SESSIONE: {identifier} ({honeypot_type.upper()}) {'='*20}\033[0m")
+    print(f"\033[1;37m📡 Sorgente Attacco (SRC IP):\033[0m \033[1;33m{src_ip}\033[0m")
+    
+    # 1. Input Originale
+    print(f"\n\033[1;35m📜 Input Fornito all'LLM:\033[0m")
+    print(f"\033[37m{result.get('llm_input_description', 'N/A')}\033[0m")
+    
+    # 2. Output LLM Dettagliato
+    print("\n\033[1;36m🧠 --- INTELLIGENZA ARTIFICIALE (LLAMA 3.1 OUTPUT) ---\033[0m")
+    print(f"  \033[1m🎯 Pattern Name:\033[0m \033[1;32m{llm.get('pattern_name', 'N/A')}\033[0m")
+    print(f"  \033[1m📝 Summary Desc:\033[0m {llm.get('summary_description', 'N/A')}")
+    print(f"  \033[1m🔎 Extended Desc:\033[0m {llm.get('extended_description', 'N/A')}")
+    print(f"  \033[1m⚙️  Tech Actions:\033[0m {llm.get('technical_actions', 'N/A')}")
+    print(f"  \033[1m💣 Payload:\033[0m \033[31m{llm.get('payload_sample', 'N/A')}\033[0m")
+    print(f"  \033[1m🔓 Prerequisites:\033[0m {llm.get('prerequisites', 'N/A')}")
+    print(f"  \033[1m🔑 Keywords:\033[0m {', '.join(llm.get('technical_keywords', []))}")
+    print(f"  \033[3m⚖️  Justification:\033[0m \"{llm.get('justification', 'N/A')}\"")
 
-    print("\033[1;35m📜 Input Fornito all'LLM:\033[0m")
-    print(f"   \033[37m{result.get('llm_input_description', 'N/A')}\033[0m")
-    print("\033[90m" + "-"*80 + "\033[0m")
+    # 3. Classifica RRF (Intermedia)
+    print("\n\033[1;36m🧮 --- CLASSIFICA INTERMEDIA (RRF - Reciprocal Rank Fusion) ---\033[0m")
+    debug_cands = result.get('rrf_candidates', [])
+    if debug_cands:
+        print(f"\033[1m{'Rank':<5} | {'CAPEC ID':<10} | {'Nome Pattern':<50} | {'Sem. #':<8} | {'Key. #':<8} | {'Score RRF':<10}\033[0m")
+        print("-" * 105)
+        for i, c in enumerate(debug_cands[:10]): # Mostra top 10 RRF
+            c_name = c['metadata']['name'][:48] + ".." if len(c['metadata']['name']) > 48 else c['metadata']['name']
+            print(f"{i+1:<5} | CAPEC-{c['capec_id']:<6} | {c_name:<50} | #{c['semantic_rank']:<6} | #{c['bm25_rank']:<6} | {c['rrf_score']:.4f}")
+    else:
+        print("  (Nessun candidato RRF trovato)")
 
-    llm_analysis = result.get('llm_analysis', {})
-    print("\033[1;35m📝 Risultato Analisi LLM:\033[0m")
-    print(f"  \033[1mPattern Inferito:\033[0m \033[1;37m{llm_analysis.get('pattern_name', 'N/A')}\033[0m")
-    if justification := llm_analysis.get('justification'):
-      print(f"  \033[1mGiustificazione LLM:\033[0m \033[3m\033[90m\"{justification}\"\033[0m")
-    print(f"  \033[1mDescrizione Dettagliata:\033[0m")
-    print(f"  \033[37m{llm_analysis.get('detailed_description', 'N/A')}\033[0m")
-    keywords = llm_analysis.get('technical_keywords', [])
-    if keywords: print(f"  \033[1mKeywords Tecniche:\033[0m \033[37m{', '.join(keywords)}\033[0m")
-    print("\033[90m" + "-"*80 + "\033[0m")
-
-    print("\033[1;35m🔗 Correlazione con Pattern di Attacco Noti (CAPEC - Top {k}):\033[0m".format(k=top_k))
+    # 4. Classifica Finale (Cross-Encoder)
+    print("\n\033[1;32m🏆 --- CLASSIFICA FINALE (Cross-Encoder Re-Ranked) ---\033[0m")
     db_matches = result.get('db_matches', [])
     if not db_matches:
-        print("  \033[1;31mNessun pattern CAPEC correlato trovato con una confidenza sufficiente.\033[0m")
+        print("  \033[1;31m❌ Nessun pattern CAPEC correlato trovato.\033[0m")
     else:
-        max_score = db_matches[0]['confidence'] if db_matches else 1.0
-
         for i, match in enumerate(db_matches):
-            relative_confidence = (match.get('confidence', 0.0) / max_score) if max_score > 0 else 0.0
+            meta = match.get('metadata', {})
+            score = match.get('cross_score', 0.0)
+            
+            if score > 2.0: conf_col = "\033[1;32m"
+            elif score > 0.0: conf_col = "\033[1;33m"
+            else: conf_col = "\033[0;37m"
 
-            if relative_confidence > 0.90: confidence_color = "\033[1;32m"
-            elif relative_confidence > 0.75: confidence_color = "\033[1;33m"
-            else: confidence_color = "\033[0;37m"
-
-            print(f"\n  \033[1m({i + 1}) CAPEC-{match.get('capec_id', 'N/A')}:\033[0m \033[1;37m{match.get('pattern', 'N/A')}\033[0m")
-            print(f"     {confidence_color}Confidenza Relativa: {relative_confidence:.2%}\033[0m")
-            print(f"     \033[90mDettaglio Ranghi -> Semantico: #{match.get('semantic_rank', 'N/A')}, Keyword: #{match.get('keyword_rank', 'N/A')}\033[0m")
-
-            desc = match.get('metadata', {}).get('description', 'N/A')
-            print(f"     \033[1mDescrizione CAPEC:\033[0m \033[37m{desc[:200]}...\033[0m")
-
-    debug_candidates = result.get('debug_candidates', [])
-    if debug_candidates:
-        print("\033[90m" + "-"*80 + "\033[0m")
-        print("\033[1;36m📊 TABELLA DI DEBUG DELLA FUSIONE RRF (Top 20 Candidati):\033[0m")
-        header = f"\033[1m{'Rank':<5} | {'CAPEC ID':<10} | {'Rango Sem.':<12} | {'Rango Key.':<12} | {'Punteggio RRF':<15}\033[0m"
-        print(header)
-        print("\033[90m" + "-" * 70 + "\033[0m")
-
-        for i, candidate in enumerate(debug_candidates):
-            line = f"{i + 1:<5} | CAPEC-{candidate['capec_id']:<9} | #{str(candidate['semantic_rank']):<11} | #{str(candidate['keyword_rank']):<11} | \033[1m{candidate['confidence']:.6f}\033[0m"
-            print(line)
+            print(f"\n  \033[1m{i+1}. [{conf_col}CAPEC-{match['capec_id']}\033[0m]: \033[1;37m{match['pattern']}\033[0m")
+            print(f"     📊 \033[90mCross-Score: {score:.4f} | Abstraction: {meta.get('abstraction', '-')}\033[0m")
+            print(f"     📍 \033[90mPosizione negli indici -> Semantico: #{match.get('semantic_rank','-')} | Keyword(BM25): #{match.get('bm25_rank','-')}\033[0m")
+            
+            # Descrizione breve
+            desc = meta.get('description', '')
+            if len(desc) > 200: desc = desc[:200] + "..."
+            print(f"     📖 {desc}")
 
     print("\033[1;44m" + "="*80 + "\033[0m\n")
 
 # ==============================================================================
-# 7. BLOCCO DI ESECUZIONE PRINCIPALE
+# 8. BLOCCO DI ESECUZIONE PRINCIPALE
 # ==============================================================================
 
 if __name__ == "__main__":
-    TOP_K_RESULTS = 5
+    TOP_K_RESULTS = 5 
 
     if not os.path.exists(HONEYPOT_CSV_FILE):
         print(f"\033[1;31m[ERRORE] File CSV '{HONEYPOT_CSV_FILE}' non trovato.\033[0m"); exit()
@@ -947,113 +968,78 @@ if __name__ == "__main__":
 
     print(f"\n\033[1;44m--- INIZIO ELABORAZIONE DATI --- \033[0m")
     try:
-        df = pd.read_csv(HONEYPOT_CSV_FILE, delimiter=';', encoding='utf-8-sig', dtype={'called_number': str}, low_memory=False)
-        print(f"\033[1;32m[DATI] Caricate {len(df)} righe totali dal CSV.\033[0m")
+        df = pd.read_csv(HONEYPOT_CSV_FILE, delimiter=';', encoding='utf-8-sig', 
+                         dtype={'called_number': str, 'dest_port': 'Int64'}, low_memory=False)
+        print(f"\033[1;32m[DATI] Caricate {len(df)} righe totali.\033[0m")
 
         if '@timestamp' in df.columns:
-            if 'timestamp' in df.columns:
-                df.drop(columns=['timestamp'], inplace=True)
+            if 'timestamp' in df.columns: df.drop(columns=['timestamp'], inplace=True)
             df.rename(columns={'@timestamp': 'timestamp'}, inplace=True)
-            print("\033[1;33m[DATI] Colonna '@timestamp' impostata come 'timestamp' di riferimento.\033[0m")
-        elif 'timestamp' not in df.columns:
-            print(f"\033[1;31m[ERRORE] Nessuna colonna di timestamp ('@timestamp' o 'timestamp') trovata nel CSV.\033[0m"); exit()
-
+        
+        if 'timestamp' not in df.columns:
+             print(f"\033[1;31m[ERRORE] Colonna 'timestamp' non trovata.\033[0m"); exit()
+        
         allowed_types = ['Cowrie', 'Honeytrap', 'Dionaea', 'Sentrypeer', 'Ciscoasa']
+        if 'type' not in df.columns:
+             print(f"\033[1;31m[ERRORE] Colonna 'type' mancante.\033[0m"); exit()
+             
         df_filtered = df[df['type'].isin(allowed_types)].copy()
-        print(f"\033[1;33m[DATI] Filtrate per tipi supportati -> {len(df_filtered)} righe.\033[0m")
-
-        initial_rows = len(df_filtered)
+        
         noise_patterns = ['Traceback', 'Exception occurred', 'Stopping server', 'Request timed out', 'ssl.SSLEOFError', 'socketserver.py', 'NameError', 'RecursionError']
         if 'message' in df_filtered.columns:
              for pattern in noise_patterns:
                 df_filtered = df_filtered[~df_filtered['message'].str.contains(pattern, na=False)]
-        print(f"\033[1;33m[DATI] Filtrate per rumore -> {len(df_filtered)} righe. ({initial_rows - len(df_filtered)} scartate)\033[0m")
 
-        if 'timestamp' in df_filtered.columns:
-            df_filtered['timestamp'] = pd.to_datetime(df_filtered['timestamp'], errors='coerce')
-
-        for col in [c for c in ['dest_port', 'attack_connection.payload.length'] if c in df_filtered.columns]:
-            df_filtered[col] = pd.to_numeric(df_filtered[col], errors='coerce').fillna(-1).astype(int)
-
-        print(f"\033[1;32m[DATI] Tipi di dati convertiti.\033[0m")
+        df_filtered['timestamp'] = pd.to_datetime(df_filtered['timestamp'], errors='coerce')
+        
+        if 'dest_port' in df_filtered.columns:
+             df_filtered['dest_port'] = df_filtered['dest_port'].fillna(0).astype(int)
 
     except Exception as e:
-        print(f"\033[1;31m[ERRORE] Lettura/Processamento CSV fallito: {e}\033[0m"); traceback.print_exc(); exit()
+        print(f"\033[1;31m[ERRORE] Lettura/Elaborazione CSV: {e}\033[0m"); traceback.print_exc(); exit()
 
     base_required_cols = ['type', 'timestamp', 'src_ip']
-    initial_rows = len(df_filtered)
-    df_filtered.dropna(subset=[c for c in base_required_cols if c in df_filtered.columns], inplace=True)
-    print(f"\033[1;33m[DATI] Filtrate per valori essenziali mancanti -> {len(df_filtered)} righe. ({initial_rows - len(df_filtered)} scartate)\033[0m")
-
-    if len(df_filtered) == 0: print(f"\033[1;31m[ERRORE] Nessuna riga valida trovata.\033[0m"); exit()
-    print(f"\033[1;42m--- ELABORAZIONE DATI COMPLETATA --- \033[0m")
+    df_filtered.dropna(subset=base_required_cols, inplace=True)
+    
+    if len(df_filtered) == 0: 
+        print(f"\033[1;31m[ERRORE] Nessuna riga valida dopo il filtro.\033[0m"); exit()
 
     sessions_to_process = defaultdict(list)
 
     if 'session' in df_filtered.columns:
         cowrie_df = df_filtered[(df_filtered['type'] == 'Cowrie') & df_filtered['session'].notna()].copy()
-        if not cowrie_df.empty:
-            print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(cowrie_df)} righe Cowrie per 'session'...\033[0m")
-            for session_id, group in cowrie_df.groupby('session'):
+        for session_id, group in cowrie_df.groupby('session'):
+            sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
+
+    other_hps = ['Ciscoasa', 'Dionaea', 'Honeytrap', 'Sentrypeer']
+    for ht in other_hps:
+        ht_df = df_filtered[df_filtered['type'] == ht].copy()
+        if not ht_df.empty:
+            for src_ip, group in ht_df.groupby('src_ip'):
+                session_id = f"{ht.lower()}_{src_ip}"
                 sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-
-    cisco_df = df_filtered[df_filtered['type'] == 'Ciscoasa'].copy()
-    if not cisco_df.empty:
-        print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(cisco_df)} righe CiscoASA per 'src_ip'...\033[0m")
-        for src_ip, group in cisco_df.groupby('src_ip'):
-            session_id = f"ciscoasa_{src_ip}"
-            sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-
-    dionaea_df = df_filtered[df_filtered['type'] == 'Dionaea'].copy()
-    if not dionaea_df.empty:
-        print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(dionaea_df)} righe Dionaea per 'src_ip'...\033[0m")
-        for src_ip, group in dionaea_df.groupby('src_ip'):
-            session_id = f"dionaea_{src_ip}"
-            sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-
-    honeytrap_df = df_filtered[df_filtered['type'] == 'Honeytrap'].copy()
-    if not honeytrap_df.empty:
-        print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(honeytrap_df)} righe Honeytrap per 'src_ip'...\033[0m")
-        for src_ip, group in honeytrap_df.groupby('src_ip'):
-            session_id = f"honeytrap_{src_ip}"
-            sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
-
-    sentrypeer_df = df_filtered[df_filtered['type'] == 'Sentrypeer'].copy()
-    if not sentrypeer_df.empty:
-        print(f"\n\033[1;36m[RAGGRUPPAMENTO] Raggruppamento di {len(sentrypeer_df)} righe SentryPeer per 'src_ip'...\033[0m")
-        for src_ip, group in sentrypeer_df.groupby('src_ip'):
-            session_id = f"sentrypeer_{src_ip}"
-            sessions_to_process[session_id] = group.sort_values(by='timestamp').to_dict('records')
 
     print(f"\033[1;32m[RAGGRUPPAMENTO] Create {len(sessions_to_process)} sessioni totali da analizzare.\033[0m")
 
     analyzed_count = 0
     if sessions_to_process:
-        for session_id, entries in tqdm(sessions_to_process.items(), desc="[ANALISI] Processo Sessioni Raggruppate"):
+        for session_id, entries in tqdm(sessions_to_process.items(), desc="[ANALISI] Processo Sessioni"):
             h_type = entries[0]['type']
-            print(f"\n\033[1;44m--- ANALISI SESSIONE: {session_id} ({h_type}) ---\033[0m")
+            
             try:
-                result = analyzer.analyze(generate_llm_input(entries, h_type), h_type, db_manager, top_k=TOP_K_RESULTS)
+                llm_input = generate_llm_input(entries, h_type)
+            except Exception as e:
+                print(f"[WARN] Errore generazione input per {session_id}: {e}")
+                continue
+
+            try:
+                result = analyzer.analyze(llm_input, h_type, db_manager, top_k=TOP_K_RESULTS)
                 result['src_ip'] = entries[0].get('src_ip', 'N/A')
                 print_analysis_result(result, h_type, f"Sessione: {session_id}", TOP_K_RESULTS)
                 analyzed_count += 1
+                
             except Exception as e:
                 print(f"\033[1;31m[ERRORE] Analisi sessione {session_id} fallita: {e}\033[0m"); traceback.print_exc()
 
-    other_rows_df = df_filtered[~df_filtered['type'].isin(['Cowrie', 'Ciscoasa', 'Dionaea', 'Honeytrap', 'Sentrypeer'])]
-    if not other_rows_df.empty:
-        print(f"\n\033[1;36m[ANALISI] Processo di {len(other_rows_df)} eventi singoli...\033[0m")
-        for index, entry in tqdm(other_rows_df.iterrows(), total=len(other_rows_df), desc="[ANALISI] Altri Tipi"):
-            h_type = entry.get('type')
-            print(f"\n\033[1;44m--- ANALISI RIGA: {index} ({h_type}) ---\033[0m")
-            try:
-                result = analyzer.analyze(generate_llm_input(entry.to_dict(), h_type), h_type, db_manager, top_k=TOP_K_RESULTS)
-                result.update(entry.to_dict())
-                print_analysis_result(result, h_type, f"Riga Index: {index}", TOP_K_RESULTS)
-                analyzed_count += 1
-            except Exception as e:
-                print(f"\033[1;31m[ERRORE] Analisi riga {index} fallita: {e}\033[0m"); traceback.print_exc()
-
     print(f"\n\033[1;42m{'=' * 80}\033[0m")
-    print(f"\033[1;32mANALISI GLOBALE COMPLETATA. {analyzed_count} eventi/sessioni analizzate.\033[0m")
-    print(f"\033[1;42m{'=' * 80}\033[0m\n")
+    print(f"\033[1;32mANALISI GLOBALE COMPLETATA. {analyzed_count} eventi analizzati con successo.\033[0m")
